@@ -222,18 +222,16 @@ void kernel_main() {
                 dfb_ex_partial.pop_front(1);
 
                 const uint32_t l1_read_addr_ex = dfb_ex.get_read_ptr();
-                const MulticastEndpoint mcast_dst;
                 noc.async_write_multicast(
                     CoreLocalMem<uint32_t>(l1_read_addr_ex),
-                    mcast_dst,
+                    read_ptr_view(dfb_ex),
                     num_bytes_read,
                     num_mcast_cores_mid_group,
                     {},
                     {.noc_x_start = mcast_dest_noc_start_x,
                      .noc_y_start = mcast_dest_noc_start_y,
                      .noc_x_end = mcast_dest_noc_end_x,
-                     .noc_y_end = mcast_dest_noc_end_y,
-                     .addr = l1_read_addr_ex},
+                     .noc_y_end = mcast_dest_noc_end_y},
                     true);
                 reduce_sender_sem.set_multicast(
                     noc,
@@ -247,15 +245,14 @@ void kernel_main() {
                 if (has_mcast_first_group) {
                     noc.async_write_multicast(
                         CoreLocalMem<uint32_t>(l1_read_addr_ex),
-                        mcast_dst,
+                        read_ptr_view(dfb_ex),
                         num_bytes_read,
                         num_mcast_cores_first_group,
                         {},
                         {.noc_x_start = mcast_first_group_dest_noc_start_x,
                          .noc_y_start = mcast_first_group_dest_noc_start_y,
                          .noc_x_end = mcast_first_group_dest_noc_end_x,
-                         .noc_y_end = mcast_first_group_dest_noc_end_y,
-                         .addr = l1_read_addr_ex},
+                         .noc_y_end = mcast_first_group_dest_noc_end_y},
                         true);
                     reduce_sender_sem.set_multicast(
                         noc,
@@ -270,15 +267,14 @@ void kernel_main() {
                 if (has_mcast_last_group) {
                     noc.async_write_multicast(
                         CoreLocalMem<uint32_t>(l1_read_addr_ex),
-                        mcast_dst,
+                        read_ptr_view(dfb_ex),
                         num_bytes_read,
                         num_mcast_cores_last_group,
                         {},
                         {.noc_x_start = mcast_last_group_dest_noc_start_x,
                          .noc_y_start = mcast_last_group_dest_noc_start_y,
                          .noc_x_end = mcast_last_group_dest_noc_end_x,
-                         .noc_y_end = mcast_last_group_dest_noc_end_y,
-                         .addr = l1_read_addr_ex},
+                         .noc_y_end = mcast_last_group_dest_noc_end_y},
                         true);
                     reduce_sender_sem.set_multicast(
                         noc,
