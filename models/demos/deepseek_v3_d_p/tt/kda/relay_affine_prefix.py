@@ -65,6 +65,8 @@ class RelayAffinePrefix:
     def shared(cls, mesh_device, **kwargs) -> RelayAffinePrefix:
         """One relay per mesh and geometry (mesh ids are never reused): layers run one after another, so they share
         its L1 landing buffer."""
+        if kwargs.get("cores") is not None:
+            kwargs["cores"] = tuple((c.x, c.y) if hasattr(c, "x") else tuple(c) for c in kwargs["cores"])
         key = (mesh_device.id(), tuple(sorted(kwargs.items())))
         if key not in cls._shared:
             cls._shared[key] = cls(mesh_device, **kwargs)
@@ -81,6 +83,7 @@ class RelayAffinePrefix:
         num_links,
         local_rows,
         math_fidelity=ttnn.MathFidelity.HiFi2,
+        cores=None,
     ):
         if key_dim != value_dim:
             raise ValueError("relay prefix requires K == V")
@@ -94,9 +97,11 @@ class RelayAffinePrefix:
         self.axis = sequence_parallel_axis
         self.num_links = num_links
         self.local_rows = local_rows
-        # One core per head, then one sender per link, in the grid's row-major order.
-        grid = mesh_device.compute_with_storage_grid_size()
-        cores = [ttnn.CoreCoord(x, y) for y in range(grid.y) for x in range(grid.x)]
+        # One core per head, then one sender per link: the given cores, else the grid in row-major order.
+        if cores is None:
+            grid = mesh_device.compute_with_storage_grid_size()
+            cores = [ttnn.CoreCoord(x, y) for y in range(grid.y) for x in range(grid.x)]
+        cores = [c if isinstance(c, ttnn.CoreCoord) else ttnn.CoreCoord(*c) for c in cores]
         if batch_heads + num_links > len(cores):
             raise ValueError(f"relay prefix needs {batch_heads + num_links} cores, has {len(cores)}")
         self.cores = cores[: batch_heads + num_links]
