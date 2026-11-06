@@ -38,6 +38,9 @@ from models.demos.deepseek_v3_d_p.tt.kda.weights import KDAWeights, load_kda_wei
 from models.demos.deepseek_v3_d_p.tt.tt_ccl import per_axis_topology
 from models.tt_transformers.tt.ccl import TT_CCL
 
+# Program commands per write that tells a device to fetch them, while a layer is queued (KDA.forward).
+_PROGRAM_DOORBELL_BATCH_BYTES = 64 * 1024
+
 
 def _largest_divisor_at_most(value: int, limit: int) -> int:
     for divisor in range(limit, 0, -1):
@@ -637,6 +640,24 @@ class ttKDA:
         self._validate_forward(hidden_states, state, actual_start)
         if actual_end is not None:
             self._validate_runtime_bound(actual_end, "actual_end")
+        # Outside a trace the layer is bound by the host's time to queue it. Its programs share the write that tells
+        # each device to fetch them, up to _PROGRAM_DOORBELL_BATCH_BYTES of commands, instead of one per program per
+        # device; the layer's last programs go out when the batching ends. The host waits on none of them in between.
+        if not isinstance(self.device, ttnn.MeshDevice):
+            return self._forward(hidden_states, state, actual_start, actual_end)
+        self.device.set_program_doorbell_batching(_PROGRAM_DOORBELL_BATCH_BYTES)
+        try:
+            return self._forward(hidden_states, state, actual_start, actual_end)
+        finally:
+            self.device.set_program_doorbell_batching(0)
+
+    def _forward(
+        self,
+        hidden_states: ttnn.Tensor,
+        state: KdaState,
+        actual_start: ttnn.Tensor,
+        actual_end: ttnn.Tensor | None,
+    ) -> tuple[ttnn.Tensor, KdaState]:
         # The SP predecessor's relay can write into this rank's landing buffer before its own recurrence starts. The
         # convolution's history-exchange entry barrier below keeps every rank from relaying until all have reserved it:
         # keep an SP barrier between this reservation and the recurrence.
