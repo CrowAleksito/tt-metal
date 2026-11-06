@@ -1484,6 +1484,12 @@ void MeshDeviceImpl::record_switch_during_capture(
         trace.through.insert(to_manager_id);
     }
 }
+void MeshDeviceImpl::set_program_doorbell_batching(uint32_t max_bytes) {
+    auto lock = lock_api();
+    for (auto* device : this->get_devices()) {
+        device->sysmem_manager().set_doorbell_batching(max_bytes);
+    }
+}
 void MeshDeviceImpl::set_active_sub_device_manager_view(SubDeviceManagerId sub_device_manager_id) {
     validate_sub_device_manager_tracker();
     sub_device_manager_tracker_->set_active_sub_device_manager_view(sub_device_manager_id);
@@ -2430,6 +2436,7 @@ void MeshDevice::load_sub_device_manager(SubDeviceManagerId sub_device_manager_i
     pimpl_->load_sub_device_manager(sub_device_manager_id);
 }
 void MeshDevice::clear_loaded_sub_device_manager() { pimpl_->clear_loaded_sub_device_manager(); }
+void MeshDevice::set_program_doorbell_batching(uint32_t max_bytes) { pimpl_->set_program_doorbell_batching(max_bytes); }
 CoreCoord MeshDevice::virtual_program_dispatch_core(uint8_t cq_id) const {
     return pimpl_->virtual_program_dispatch_core(cq_id);
 }

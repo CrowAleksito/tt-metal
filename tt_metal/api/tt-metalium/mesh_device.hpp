@@ -217,6 +217,12 @@ public:
     void remove_sub_device_manager(SubDeviceManagerId sub_device_manager_id) override;
     void load_sub_device_manager(SubDeviceManagerId sub_device_manager_id) override;
     void clear_loaded_sub_device_manager() override;
+    // Lets the fetch queue entries of consecutive programs be written once for up to max_bytes of their commands
+    // instead of once per program per device (about 0.3 us each on hardware): a program's commands may then reach the
+    // device only with the next command. Any other command (reads, writes, events, finish), and setting max_bytes to 0,
+    // sends them; between those the host must not wait on the programs other than through this mesh's command queues.
+    // 0, the default, sends every program at once.
+    void set_program_doorbell_batching(uint32_t max_bytes);
     CoreCoord virtual_program_dispatch_core(uint8_t cq_id) const override;
     const std::vector<SubDeviceId>& get_sub_device_ids() const override;
     const std::vector<SubDeviceId>& get_sub_device_stall_group() const override;

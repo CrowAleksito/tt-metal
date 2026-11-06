@@ -134,6 +134,9 @@ SystemMemoryManager::SystemMemoryManager(MetalEnvImpl& env, MetalContext& ctx, C
     prefetch_q_dev_fences(num_hw_cqs),
     // The ring starts zeroed, which reads as phase 0, so the first lap writes phase 1.
     prefetch_q_phases(num_hw_cqs, 1) {
+    // Sized once: CQs of the device may be driven from different threads.
+    this->deferred_commands_.resize(num_hw_cqs);
+    this->pending_fetch_bytes_.resize(num_hw_cqs, 0);
     this->prefetch_q_windows.reserve(num_hw_cqs);
     this->completion_q_windows.reserve(num_hw_cqs);
 
@@ -199,6 +202,8 @@ SystemMemoryManager::SystemMemoryManager(MetalEnvImpl& env, MetalContext& ctx, C
     ChipId mmio_device_id = env_.get_cluster().get_associated_mmio_device(device_id);
     uint16_t channel = env_.get_cluster().get_assigned_channel_for_device(device_id);
     char* hugepage_start = static_cast<char*>(env_.get_cluster().host_dma_address(0, mmio_device_id, channel));
+    // Where issue_queue_push_back mirrors the write pointer: Cluster::write_sysmem's offset 0 for this channel.
+    this->host_ptr_mirror_base_ = hugepage_start;
     hugepage_start += (channel >> 2) * DispatchSettings::MAX_DEV_CHANNEL_SIZE;
     this->cq_sysmem_start = hugepage_start;
 
@@ -418,6 +423,15 @@ void SystemMemoryManager::set_issue_queue_size(const uint8_t cq_id, const uint32
 }
 
 void SystemMemoryManager::set_bypass_mode(const bool enable, const bool clear) {
+    if (enable && !this->bypass_enable) {
+        // Deferred commands and held-back fetches belong before what bypass mode captures.
+        for (uint8_t cq_id = 0; cq_id < this->deferred_commands_.size(); cq_id++) {
+            this->flush_deferred_commands(cq_id);
+        }
+        for (uint8_t cq_id = 0; cq_id < this->pending_fetch_bytes_.size(); cq_id++) {
+            this->flush_pending_fetch(cq_id);
+        }
+    }
     this->bypass_enable = enable;
     if (clear) {
         this->bypass_buffer.clear();
@@ -516,6 +530,45 @@ ChipId SystemMemoryManager::get_device_id() const { return this->device_id; }
 std::vector<SystemMemoryCQInterface>& SystemMemoryManager::get_cq_interfaces() { return this->cq_interfaces; }
 
 void* SystemMemoryManager::issue_queue_reserve(uint32_t cmd_size_B, const uint8_t cq_id) {
+    this->flush_deferred_commands(cq_id);
+    return this->issue_queue_reserve_impl(cmd_size_B, cq_id);
+}
+
+void SystemMemoryManager::defer_commands(std::shared_ptr<const std::vector<uint32_t>> commands, const uint8_t cq_id) {
+    this->flush_deferred_commands(cq_id);
+    this->deferred_commands_.at(cq_id) = std::move(commands);
+    if (is_mock_device() || this->bypass_enable) {
+        this->flush_deferred_commands(cq_id);
+    }
+}
+
+void SystemMemoryManager::flush_deferred_commands(const uint8_t cq_id) {
+    if (cq_id >= this->deferred_commands_.size() || !this->deferred_commands_[cq_id]) {
+        return;
+    }
+    const auto commands = std::move(this->deferred_commands_[cq_id]);
+    this->deferred_commands_[cq_id].reset();
+    const uint32_t size = commands->size() * sizeof(uint32_t);
+    this->issue_queue_reserve_impl(size, cq_id);
+    this->cq_write(commands->data(), size, this->get_issue_queue_write_ptr(cq_id));
+    this->issue_queue_push_back(size, cq_id);
+    this->fetch_queue_reserve_back(cq_id);
+    this->fetch_queue_write(size, cq_id);
+}
+
+uint32_t SystemMemoryManager::issue_queue_reserve_after_deferred(
+    uint32_t cmd_size_B, const uint8_t cq_id, uint32_t& deferred_size_B) {
+    deferred_size_B = this->deferred_commands_size(cq_id);
+    this->issue_queue_reserve_impl(deferred_size_B + cmd_size_B, cq_id);
+    const uint32_t write_ptr = this->get_issue_queue_write_ptr(cq_id);
+    if (deferred_size_B != 0) {
+        this->cq_write(this->deferred_commands_[cq_id]->data(), deferred_size_B, write_ptr);
+        this->deferred_commands_[cq_id].reset();
+    }
+    return write_ptr + deferred_size_B;
+}
+
+void* SystemMemoryManager::issue_queue_reserve_impl(uint32_t cmd_size_B, const uint8_t cq_id) {
     if (is_mock_device()) {
         thread_local std::array<char, 65536> dummy_buffer{};
         return dummy_buffer.data();
@@ -534,6 +587,8 @@ void* SystemMemoryManager::issue_queue_reserve(uint32_t cmd_size_B, const uint8_
     const uint32_t alignment = is_dram_backed() ? env_.get_hal().get_alignment(tt::tt_metal::HalMemType::DRAM)
                                                 : env_.get_hal().get_alignment(tt::tt_metal::HalMemType::HOST);
     if (issue_q_write_ptr + align(cmd_size_B, alignment) > command_issue_limit) {
+        // Commands whose fetch is held back end at the limit: fetch them before the queue wraps.
+        this->flush_pending_fetch(cq_id);
         this->wrap_issue_queue_wr_ptr(cq_id);
         issue_q_write_ptr = this->get_issue_queue_write_ptr(cq_id);
     }
@@ -633,7 +688,16 @@ void SystemMemoryManager::issue_queue_push_back(uint32_t push_size_B, const uint
         return;
     }
 
-    // Also store this data in hugepages, so if a hang happens we can see what was written by host.
+    // Also store this data in hugepages, so if a hang happens we can see what was written by host. A plain store into
+    // the mapped hugepage, as Cluster::write_sysmem does through UMD, without its lookups on every push.
+    if (this->host_ptr_mirror_base_ != nullptr) {
+        const uint32_t value = cq_interface.issue_fifo_wr_ptr;
+        std::memcpy(
+            this->host_ptr_mirror_base_ + issue_q_wr_ptr + get_relative_cq_offset(cq_id, this->cq_size),
+            &value,
+            sizeof(value));
+        return;
+    }
     ChipId mmio_device_id = env_.get_cluster().get_associated_mmio_device(this->device_id);
     uint16_t channel = env_.get_cluster().get_assigned_channel_for_device(this->device_id);
     env_.get_cluster().write_sysmem(
@@ -844,11 +908,74 @@ void SystemMemoryManager::completion_queue_pop_front(uint32_t num_pages_read, co
     this->send_completion_queue_read_ptr(cq_id);
 }
 
+uint32_t SystemMemoryManager::pending_fetch_bytes(const uint8_t cq_id) const {
+    return cq_id < this->pending_fetch_bytes_.size() ? this->pending_fetch_bytes_[cq_id] : 0;
+}
+
+bool SystemMemoryManager::can_coalesce(uint32_t command_size_B) const {
+    const uint32_t alignment = is_dram_backed() ? env_.get_hal().get_alignment(tt::tt_metal::HalMemType::DRAM)
+                                                : env_.get_hal().get_alignment(tt::tt_metal::HalMemType::HOST);
+    // issue_queue_push_back pads each command to the alignment; an entry covering several commands must not cover
+    // padding, which the prefetcher would read as commands.
+    return !is_mock_device() && !this->bypass_enable && command_size_B % alignment == 0;
+}
+
+void SystemMemoryManager::fetch_queue_write_lazy(uint32_t command_size_B, const uint8_t cq_id) {
+    if (this->doorbell_batch_bytes_ == 0 || !this->can_coalesce(command_size_B)) {
+        this->fetch_queue_write(command_size_B, cq_id);
+        return;
+    }
+    auto& pending = this->pending_fetch_bytes_.at(cq_id);
+    if (pending + command_size_B <= this->doorbell_batch_bytes_) {
+        pending += command_size_B;
+        return;
+    }
+    this->flush_pending_fetch(cq_id);
+    if (command_size_B <= this->doorbell_batch_bytes_) {
+        pending = command_size_B;
+        return;
+    }
+    this->write_fetch_queue_entry(command_size_B, cq_id, /*stall_prefetcher=*/false);
+}
+
+void SystemMemoryManager::set_doorbell_batching(uint32_t max_bytes) {
+    for (uint8_t cq_id = 0; cq_id < this->pending_fetch_bytes_.size(); cq_id++) {
+        this->flush_pending_fetch(cq_id);
+    }
+    this->doorbell_batch_bytes_ = std::min(max_bytes, ctx_.dispatch_mem_map().max_prefetch_command_size());
+}
+
+void SystemMemoryManager::flush_pending_fetch(const uint8_t cq_id) {
+    if (cq_id >= this->pending_fetch_bytes_.size() || this->pending_fetch_bytes_[cq_id] == 0) {
+        return;
+    }
+    const uint32_t pending = this->pending_fetch_bytes_[cq_id];
+    this->pending_fetch_bytes_[cq_id] = 0;
+    this->fetch_queue_reserve_back(cq_id);
+    this->write_fetch_queue_entry(pending, cq_id, /*stall_prefetcher=*/false);
+}
+
 void SystemMemoryManager::fetch_queue_write(uint32_t command_size_B, const uint8_t cq_id, bool stall_prefetcher) {
     if (is_mock_device()) {
         return;
     }
+    // Commands whose fetch was held back (fetch_queue_write_lazy) go first: in this command's entry when they fit,
+    // which they do contiguously (issue_queue_reserve_impl writes them before wrapping).
+    const uint32_t pending = this->pending_fetch_bytes(cq_id);
+    if (pending != 0) {
+        if (!stall_prefetcher && this->can_coalesce(command_size_B) &&
+            pending + command_size_B <= ctx_.dispatch_mem_map().max_prefetch_command_size()) {
+            this->pending_fetch_bytes_[cq_id] = 0;
+            command_size_B += pending;
+        } else {
+            this->flush_pending_fetch(cq_id);
+            this->fetch_queue_reserve_back(cq_id);
+        }
+    }
+    this->write_fetch_queue_entry(command_size_B, cq_id, stall_prefetcher);
+}
 
+void SystemMemoryManager::write_fetch_queue_entry(uint32_t command_size_B, const uint8_t cq_id, bool stall_prefetcher) {
     const DispatchMemMap& dispatch_mem_map = ctx_.dispatch_mem_map();
     const uint32_t max_command_size_B = dispatch_mem_map.max_prefetch_command_size();
     TT_ASSERT(

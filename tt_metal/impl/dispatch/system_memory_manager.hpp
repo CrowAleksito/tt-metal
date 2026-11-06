@@ -80,7 +80,23 @@ public:
 
     std::vector<SystemMemoryCQInterface>& get_cq_interfaces();
 
+    // Writes any deferred commands (defer_commands) first, as their own fetch queue entry.
     void* issue_queue_reserve(uint32_t cmd_size_B, uint8_t cq_id);
+
+    // Holds `commands` back so that the next command written through issue_queue_reserve_after_deferred
+    // shares their fetch queue entry, saving the entry's write to the device (about 0.3 us). A sub-device manager
+    // switch defers its commands to the next program this way. Any other issue_queue_reserve writes them first. Writes
+    // them at once in bypass mode or on a mock device.
+    void defer_commands(std::shared_ptr<const std::vector<uint32_t>> commands, uint8_t cq_id);
+    uint32_t deferred_commands_size(uint8_t cq_id) const {
+        return cq_id < deferred_commands_.size() && deferred_commands_[cq_id]
+                   ? deferred_commands_[cq_id]->size() * sizeof(uint32_t)
+                   : 0;
+    }
+    // Reserves room for the deferred commands and cmd_size_B more, and writes the deferred commands. Returns the write
+    // pointer after them, where the caller writes its command; it then pushes back and fetches deferred_size +
+    // cmd_size_B as one entry.
+    uint32_t issue_queue_reserve_after_deferred(uint32_t cmd_size_B, uint8_t cq_id, uint32_t& deferred_size_B);
 
     void cq_write(const void* data, uint32_t size_in_bytes, uint32_t write_ptr);
 
@@ -101,7 +117,16 @@ public:
 
     void fetch_queue_reserve_back(uint8_t cq_id);
 
+    // Writes the fetch queue entry that makes the prefetcher read the command just pushed back (about 0.3 us on
+    // hardware). Commands whose entry fetch_queue_write_lazy held back share it when they fit.
     void fetch_queue_write(uint32_t command_size_B, uint8_t cq_id, bool stall_prefetcher = false);
+    // Like fetch_queue_write, but may hold the entry back so that the commands after it share one, up to the doorbell
+    // batch size (set_doorbell_batching). For programs: any other fetch_queue_write, an issue queue wrap or bypass mode
+    // writes the held-back entry.
+    void fetch_queue_write_lazy(uint32_t command_size_B, uint8_t cq_id);
+    // At most max_bytes of commands per held-back entry (capped at the maximum fetch size); 0 holds nothing back.
+    // Writes the held-back entries.
+    void set_doorbell_batching(uint32_t max_bytes);
 
     // Both CQs on the device must be idle when this is called.
     void set_current_and_last_completed_event(
@@ -127,6 +152,22 @@ private:
     ChipId device_id = 0;
     std::vector<uint32_t> completion_byte_addrs;
     char* cq_sysmem_start = nullptr;
+    // Start of the hugepage mapping the issue write pointer mirror is stored at (issue_queue_push_back).
+    char* host_ptr_mirror_base_ = nullptr;
+    // Per CQ, commands held back by defer_commands.
+    std::vector<std::shared_ptr<const std::vector<uint32_t>>> deferred_commands_;
+    void* issue_queue_reserve_impl(uint32_t cmd_size_B, uint8_t cq_id);
+    // Writes the deferred commands, if any, as their own fetch queue entry.
+    void flush_deferred_commands(uint8_t cq_id);
+    // Writes the held-back fetch queue entry, if any.
+    void flush_pending_fetch(uint8_t cq_id);
+    uint32_t pending_fetch_bytes(uint8_t cq_id) const;
+    bool can_coalesce(uint32_t command_size_B) const;
+    void write_fetch_queue_entry(uint32_t command_size_B, uint8_t cq_id, bool stall_prefetcher);
+    // Per CQ, bytes pushed back whose fetch queue entry fetch_queue_write_lazy holds back.
+    std::vector<uint32_t> pending_fetch_bytes_;
+    // MeshDevice::set_program_doorbell_batching.
+    uint32_t doorbell_batch_bytes_ = 0;
     std::vector<SystemMemoryCQInterface> cq_interfaces;
     uint32_t cq_size = 0;
     uint32_t channel_offset = 0;

@@ -480,6 +480,20 @@ void py_module(nb::module_& mod) {
                Clears the loaded sub-device manager for the given mesh device.
            )doc")
         .def(
+            "set_program_doorbell_batching",
+            &MeshDevice::set_program_doorbell_batching,
+            nb::arg("max_bytes"),
+            R"doc(
+               Lets consecutive programs share the write that tells each device to fetch them, for up to max_bytes of
+               their commands, instead of one write per program per device. A program may then reach the devices only
+               with the next command: any other command (reads, writes, events, synchronize), and max_bytes 0, sends
+               them. Between those, the host must not wait on the programs other than through the mesh's command
+               queues. 0, the default, sends every program at once.
+
+               Args:
+                   max_bytes (int): The most program commands per write; 0 disables batching.
+           )doc")
+        .def(
             "remove_sub_device_manager",
             &MeshDevice::remove_sub_device_manager,
             nb::arg("sub_device_manager_id"),
