@@ -896,6 +896,9 @@ public:
             // outlive the cache miss and every program on the occupied ranges can reference them.
             // Shared ownership keeps the device allocation alive for the life of the cache entry.
             std::shared_ptr<std::vector<tt::tt_metal::MeshTensor>> op_owned_tensors;
+            // The address each binding's tensor had when the program was last refreshed: a hit that finds every one
+            // unchanged leaves the program as it is (empty until the first hit records them).
+            std::vector<tt::tt_metal::DeviceAddr> bound_addresses;
         };
 
         // Cache-hit tensor refresh, shared so the two adapters' hit paths cannot drift apart.
@@ -907,7 +910,7 @@ public:
             const auto io_mesh_tensors = collect_mesh_tensors(tensor_args, tensor_return_value);
             const bool skip_validation = !ttnn::CONFIG.get<"validate_program_args">();
             for (auto& [coordinate_range, program] : cached_workload.workload.get_programs()) {
-                const auto& sv = cached_workload.shared_variables.at(coordinate_range);
+                auto& sv = cached_workload.shared_variables.at(coordinate_range);
 
                 // Reproduce the cache-miss enumeration: fresh io tensors, then the
                 // parked op-owned tensors (stable addresses, retrieved from the cache).
@@ -916,6 +919,19 @@ public:
                     for (const auto& op_owned_tensor : *sv.op_owned_tensors) {
                         mesh_tensors.push_back(std::cref(op_owned_tensor));
                     }
+                }
+
+                // A hit matches every spec the program was built for, so a binding whose tensor kept its address
+                // would be rewritten with the value it holds: skip the program when every binding did.
+                bool unchanged = sv.bound_addresses.size() == sv.bindings.size();
+                sv.bound_addresses.resize(sv.bindings.size());
+                for (std::size_t i = 0; i < sv.bindings.size(); ++i) {
+                    const auto address = mesh_tensors[sv.bindings[i].tensor_idx].get().address();
+                    unchanged = unchanged && sv.bound_addresses[i] == address;
+                    sv.bound_addresses[i] = address;
+                }
+                if (unchanged) {
+                    continue;
                 }
 
                 tt::tt_metal::experimental::Table<TensorParamName, TensorArgument> fresh_tensor_args;
