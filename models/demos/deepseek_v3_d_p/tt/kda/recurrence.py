@@ -13,6 +13,7 @@ from contextlib import nullcontext
 from dataclasses import dataclass
 from typing import Any
 
+import torch
 from loguru import logger
 
 import ttnn
@@ -107,6 +108,29 @@ class _RecurrenceComputeConfig:
     scan: ttnn.DeviceComputeKernelConfig
 
 
+_sp_ranks: dict = {}
+
+
+def sp_rank_tensor(device: ttnn.MeshDevice, sequence_parallel_axis: int) -> ttnn.Tensor:
+    """Each device's rank along the SP axis as a UINT32 row-major scalar, one per mesh and axis (mesh ids are never
+    reused). The chronology ops read it on the device, so the host builds one program for the whole mesh instead of
+    one per SP rank."""
+    key = (device.id(), sequence_parallel_axis)
+    if key not in _sp_ranks:
+        sp_size = tuple(device.shape)[sequence_parallel_axis]
+        _sp_ranks[key] = ttnn.from_torch(
+            torch.arange(sp_size, dtype=torch.int64).reshape(sp_size, 1),
+            dtype=ttnn.uint32,
+            layout=ttnn.ROW_MAJOR_LAYOUT,
+            device=device,
+            memory_config=ttnn.DRAM_MEMORY_CONFIG,
+            mesh_mapper=ttnn.ShardTensor2dMesh(
+                device, dims=(0, None) if sequence_parallel_axis == 0 else (None, 0), mesh_shape=tuple(device.shape)
+            ),
+        )
+    return _sp_ranks[key]
+
+
 def _prepare_chunk_terms(
     q: ttnn.Tensor,
     k: ttnn.Tensor,
@@ -122,6 +146,7 @@ def _prepare_chunk_terms(
     gate_scale: float,
     beta_logits_column_offset: int,
     memory_config: ttnn.MemoryConfig,
+    sp_rank: ttnn.Tensor | None = None,
 ) -> _PreparedChunks:
     # Chunk preparation reads each head's logit column in place from the token-major projection and activates it.
     outputs = ttnn.experimental.kda.prepare_chunk_recurrence(
@@ -139,6 +164,7 @@ def _prepare_chunk_terms(
         sequence_parallel_axis=sequence_parallel_axis,
         gate_scale=gate_scale,
         beta_logits_column_offset=beta_logits_column_offset,
+        sp_rank=sp_rank,
     )
     return _PreparedChunks(*outputs)
 
@@ -344,6 +370,7 @@ def _scan_sp_chunks(
     compute_config: _RecurrenceComputeConfig,
     affine_relay: RelayAffinePrefix,
     final_carry: _RelayFinalCarry,
+    sp_rank: ttnn.Tensor | None = None,
     correction: EntryCorrection,
     side_windows: SideWindows | None = None,
     beside_relay: Callable[[], Any] | None = None,
@@ -364,6 +391,7 @@ def _scan_sp_chunks(
         compute_kernel_config=compute_config.preparation,
         emit_outputs=True,
         emit_memory_config=correction.terms_memory_config,
+        sp_rank=sp_rank,
     )
     # The summary is the chunk terms' last reader: free their L1 before the relay and its companion.
     for tensor in grouped.as_kernel_args():
@@ -374,7 +402,7 @@ def _scan_sp_chunks(
         entry_states, prefix_final_state = affine_relay(packed, initial_state, actual_start)
         if beside_relay is not None:
             beside = beside_relay()
-    output, rank_final = correction(*emitted, entry_states, prefix_final_state, actual_start, actual_end)
+    output, rank_final = correction(*emitted, entry_states, prefix_final_state, actual_start, actual_end, sp_rank)
     for tensor in (*emitted, entry_states):
         ttnn.deallocate(tensor)
 
@@ -560,6 +588,8 @@ class KDARecurrence:
                 f"{preparation_budget // 1024} KiB L1 budget; keeping them in DRAM, so chunk "
                 f"preparation and the scan run slower ({heads} heads, {local_rows} rows per device)."
             )
+        # With SP the chronology ops read each device's rank from a tensor: one program for the whole mesh.
+        self._sp_rank = sp_rank_tensor(device, sequence_parallel_axis) if self._sequence_parallel else None
         if self._sequence_parallel:
             self._execute = self._run_sp
         elif grouped:
@@ -612,6 +642,7 @@ class KDARecurrence:
             gate_scale=self._gate_scale,
             beta_logits_column_offset=beta_logits_column_offset,
             memory_config=self._preparation_memory,
+            sp_rank=self._sp_rank,
         )
         if release_gate:
             # Only chunk preparation reads the gate; freeing it here lowers L1 use during the scans.
@@ -747,4 +778,5 @@ class KDARecurrence:
             correction=self._entry_correction,
             side_windows=self._side_windows,
             beside_relay=beside_relay,
+            sp_rank=self._sp_rank,
         )

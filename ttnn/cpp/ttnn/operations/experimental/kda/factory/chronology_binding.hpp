@@ -20,8 +20,14 @@ enum class ChronologyPrograms {
     per_device,
 };
 
+// The sp_rank compile-time argument of a chronology reader that reads its rank from the device's sp_rank tensor
+// (kda_chronology::rank_from_tensor on the device side).
+inline constexpr uint32_t rank_from_tensor = 0xFFFFFFFF;
+
 // Rank belongs to mesh placement, not to caller-owned tensor data. The mesh
 // adapter retains each range's scalar specialization on program-cache hits.
+// With rank_in_tensor (the op binds an sp_rank tensor, bind_sp_rank), per_sp_rank builds one program per tensor
+// range instead, whose readers read the rank: the host then builds and dispatches one program for the whole mesh.
 inline ttnn::device_operation::MeshWorkloadArtifacts chronology_workload(
     const ttnn::device_operation::ProgramArtifacts& artifacts,
     const ttnn::MeshCoordinateRangeSet& tensor_coords,
@@ -29,11 +35,17 @@ inline ttnn::device_operation::MeshWorkloadArtifacts chronology_workload(
     uint32_t sequence_parallel_axis,
     uint32_t local_rows,
     std::initializer_list<tt::tt_metal::experimental::KernelSpecName> chronology_readers,
-    ChronologyPrograms programs = ChronologyPrograms::per_sp_rank) {
+    ChronologyPrograms programs = ChronologyPrograms::per_sp_rank,
+    bool rank_in_tensor = false) {
     using namespace tt::tt_metal::experimental;
     TT_FATAL(sequence_parallel_axis < device.shape().dims(), "KDA: invalid sequence_parallel_axis");
+    const bool one_program = rank_in_tensor && programs == ChronologyPrograms::per_sp_rank;
     std::vector<ttnn::MeshCoordinateRange> ranges;
-    if (programs == ChronologyPrograms::per_device) {
+    if (one_program) {
+        for (const auto& range : tensor_coords.ranges()) {
+            ranges.push_back(range);
+        }
+    } else if (programs == ChronologyPrograms::per_device) {
         for (const auto& coordinate : tensor_coords.coords()) {
             ranges.emplace_back(coordinate);
         }
@@ -58,7 +70,8 @@ inline ttnn::device_operation::MeshWorkloadArtifacts chronology_workload(
                 return kernel.unique_id == chronology_reader;
             });
             TT_FATAL(reader != spec.kernels.end(), "KDA: chronology reader is absent from the program");
-            reader->compile_time_args.insert({"sp_rank", range.start_coord()[sequence_parallel_axis]});
+            reader->compile_time_args.insert(
+                {"sp_rank", one_program ? rank_from_tensor : range.start_coord()[sequence_parallel_axis]});
             reader->compile_time_args.insert({"sp_size", device.shape()[sequence_parallel_axis]});
             reader->compile_time_args.insert({"local_rows", local_rows});
         }
@@ -77,9 +90,36 @@ inline ttnn::device_operation::MeshWorkloadArtifacts chronology_workload(
     uint32_t sequence_parallel_axis,
     uint32_t local_rows,
     const tt::tt_metal::experimental::KernelSpecName& chronology_reader,
-    ChronologyPrograms programs = ChronologyPrograms::per_sp_rank) {
+    ChronologyPrograms programs = ChronologyPrograms::per_sp_rank,
+    bool rank_in_tensor = false) {
     return chronology_workload(
-        artifacts, tensor_coords, device, sequence_parallel_axis, local_rows, {chronology_reader}, programs);
+        artifacts,
+        tensor_coords,
+        device,
+        sequence_parallel_axis,
+        local_rows,
+        {chronology_reader},
+        programs,
+        rank_in_tensor);
+}
+
+// Bind the optional sp_rank tensor to the chronology reader: each device's UINT32 row-major scalar holds its rank along
+// the sequence-parallel axis. Returns whether it is bound (chronology_workload's rank_in_tensor).
+inline bool bind_sp_rank(
+    tt::tt_metal::experimental::ProgramSpec& spec,
+    tt::tt_metal::experimental::ProgramRunArgs& run,
+    const std::optional<Tensor>& sp_rank,
+    tt::tt_metal::experimental::KernelSpec& reader) {
+    using namespace tt::tt_metal::experimental;
+    if (!sp_rank) {
+        return false;
+    }
+    const TensorParamName name{"sp_rank"};
+    const auto& tensor = sp_rank->mesh_tensor();
+    spec.tensor_parameters.push_back({.unique_id = name, .spec = tensor.tensor_spec()});
+    run.tensor_args.emplace(name, tensor);
+    reader.tensor_bindings.push_back({name, "sp_rank"});
+    return true;
 }
 
 inline void bind_chronology_channel(
